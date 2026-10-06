@@ -135,3 +135,7 @@ Thumbs.db
 /load-test-millions.js
 /LOAD_TEST_RESULTS.md
 /tests/load-test.ts
+/.pi/agent/local-models.json
+/sync-to-sandbox.sh
+/pi
+/.agent/kit/spec.yaml

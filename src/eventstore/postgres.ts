@@ -70,17 +70,63 @@ export class PostgresEventStore implements IEventStore {
         metadata                                             // Metadata to insert
       ];
 
-      const result = await client.query(cteQuery, params);
+      // The CTE guard reads a statement-start snapshot and takes no lock on what
+      // it aggregated, so two writers holding the same expectedMaxSequence both
+      // pass it under READ COMMITTED. Serialize writers of the same context
+      // first: the advisory lock is held until COMMIT, so the guard below is
+      // evaluated against a snapshot that contains every previously committed
+      // write to this context.
+      await client.query('BEGIN');
+      try {
+        for (const key of this.contextLockKeys(filter)) {
+          const lock = this.contextLockStatement(key);
+          await client.query(lock.text, lock.params);
+        }
 
-      if (result.rowCount === 0) {
-        throw new Error('Context changed: events were modified between query and append');
+        const result = await client.query(cteQuery, params);
+
+        if (result.rowCount === 0) {
+          throw new Error('Context changed: events were modified between query and append');
+        }
+
+        await client.query('COMMIT');
+      } catch (error) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          // The connection is gone; the original error is the one worth throwing.
+        }
+        throw error;
       }
-
-    } catch (error) {
-      throw error;
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Advisory-lock keys for the append-condition.
+   *
+   * The guard aggregates `MAX(sequence_number) WHERE event_type = ANY(...) AND
+   * <payload predicates>`. One append can only invalidate another append's guard
+   * if their filtered row sets overlap. Two filters whose *event type* sets are
+   * disjoint can never share rows, whatever their payload predicates say, so one
+   * lock per event type is a sound over-approximation: it may serialize writers
+   * that did not need serializing, never the other way round.
+   *
+   * Keys are taken in sorted order, so two appends can never hold-and-wait in
+   * opposite order on the same pair of keys — no deadlock.
+   */
+  private contextLockKeys(filter: EventFilter): string[] {
+    return [...new Set(filter.eventTypes)].sort();
+  }
+
+  /**
+   * The lock statement for one key. `hashtext()` collisions only cause spurious
+   * contention between unrelated contexts, never spurious concurrency, which is
+   * the safe direction for a correctness lock.
+   */
+  private contextLockStatement(key: string): { text: string; params: unknown[] } {
+    return { text: 'SELECT pg_advisory_xact_lock(hashtext($1))', params: [key] };
   }
 
   private buildFilterCondition(filter: EventFilter): { condition: string; params: unknown[] } {
